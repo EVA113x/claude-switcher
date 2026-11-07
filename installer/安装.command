@@ -435,9 +435,7 @@ else
         cp '$STAGE/claude-bodyguard.sh' '$STAGE/tz-watchdog.sh' '/Library/Application Support/claude-switcher/' || exit 1;
         chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' || exit 1;
         chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' || exit 1;
-        /usr/bin/xattr -d com.apple.quarantine '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' 2>/dev/null || true;
         cp -X '$H/.local/bin/local.claude-bodyguard.plist' '$H/.local/bin/local.tz-watchdog.plist' /Library/LaunchDaemons/ || exit 1;
-        /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist 2>/dev/null || true;
         chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist || exit 1;
         chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist || exit 1;
         launchctl bootout system/local.claude-bodyguard 2>/dev/null || true; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1;
@@ -445,18 +443,15 @@ else
         launchctl bootout system/local.claude-update 2>/dev/null; rm -f /Library/LaunchDaemons/local.claude-update.plist;"
     curt=$(readlink /etc/localtime 2>/dev/null)
     [ "$curt" != "/var/db/timezone/zoneinfo/$TZV" ] && SYSCMDS="$SYSCMDS /usr/sbin/systemsetup -settimezone '$TZV';"
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || SYSCMDS="$SYSCMDS networksetup -setv6off Wi-Fi;"
     SYSCMDS="$SYSCMDS dscacheutil -flushcache; killall -HUP mDNSResponder"
     echo ""
-    echo "接下来需要输入一次开机密码,用于: 安装守护进程(系统目录) + 锁定时区($TZV) + 关闭IPv6"
+    echo "接下来需要输入一次开机密码,用于: 安装守护进程(系统目录) + 锁定时区($TZV)"
     sudo bash -c "$SYSCMDS" && echo "✓ 系统级配置完成" || echo "✗ 系统级配置被取消,可稍后重新运行安装程序"
     rm -rf "$STAGE"
 
     # 自动更新:用户态 LaunchAgent(每12小时),不走 root,降低供应链风险
     mkdir -p "$H/Library/LaunchAgents"
     cp -X "$H/.local/bin/local.claude-update.plist" "$H/Library/LaunchAgents/local.claude-update.plist"
-    /usr/bin/xattr -d com.apple.quarantine "$H/Library/LaunchAgents/local.claude-update.plist" 2>/dev/null || true
     launchctl bootout "gui/$(id -u)/local.claude-update" 2>/dev/null
     if launchctl bootstrap "gui/$(id -u)" "$H/Library/LaunchAgents/local.claude-update.plist" 2>/dev/null; then
         echo "✓ 自动更新服务已注册(每12小时检查一次)"

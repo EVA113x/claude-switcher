@@ -1726,17 +1726,25 @@ set_client() {
     echo "OK:代理客户端已设为 $mode"
     
     guard_state=$(bodyguard_status)
+    guard="/Library/Application Support/claude-switcher/claude-bodyguard.sh"
+    
+    # 保镖已同步或未安装时的处理
     case "$guard_state" in
-        fail:未安装) 
-            echo "INFO:保镖尚未安装,checkdetail 会提示未安装"
-            return 0 ;;
         ok:*)
             echo "OK:保镖已同步"
             return 0 ;;
+        fail:未安装)
+            if [ "$sync" != "--sync" ]; then
+                echo "INFO:保镖尚未安装,checkdetail 会提示未安装"
+                return 0
+            fi
+            # --sync 但保镖未安装,拒绝操作(必须先运行安装器完整安装)
+            echo "FAIL:保镖尚未安装,--sync 只能更新现有保镖"
+            echo "INFO:请先运行安装器完成初始安装,再使用 --sync 切换客户端"
+            return 1 ;;
     esac
     
     # 保镖模式不一致,提供同步选项
-    guard="/Library/Application Support/claude-switcher/claude-bodyguard.sh"
     if [ ! -r "$guard" ]; then
         echo "WARN:保镖守护脚本不可读(${guard});请重新运行安装器"
         return 0
@@ -1750,32 +1758,37 @@ set_client() {
             echo "FAIL:无法创建临时文件"
             return 1
         fi
-        trap "rm -f '$temp_guard'" EXIT
+        trap "rm -f '$temp_guard'" EXIT INT TERM
         
-        # 读取现有保镖脚本,只替换 MODE 行
+        # 读取现有保镖脚本,只替换 MODE 行(输入已在 case 验证,sed 模式不含用户输入)
         if sed "s|^MODE=\"[^\"]*\"|MODE=\"$mode\"|" "$guard" > "$temp_guard"; then
             chmod 755 "$temp_guard"
-            sudo_cmd="cp '$temp_guard' '$guard' && \
-                     chown root:wheel '$guard' && \
-                     chmod 755 '$guard' && \
-                     /usr/bin/xattr -d com.apple.quarantine '$guard' 2>/dev/null || true && \
-                     launchctl bootout system/local.claude-bodyguard 2>/dev/null || true && \
-                     launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist && \
-                     launchctl print system/local.claude-bodyguard >/dev/null 2>&1"
+            # 原子写入: 先写临时位置,校验后原子 mv(同文件系统内原子)
+            sudo_cmd="set -e;
+                     cp '$temp_guard' '$guard.new' || exit 1;
+                     chown root:wheel '$guard.new' || exit 1;
+                     chmod 755 '$guard.new' || exit 1;
+                     grep -q '^MODE=\"$mode\"' '$guard.new' || exit 1;
+                     mv -f '$guard.new' '$guard' || exit 1;
+                     launchctl bootout system/local.claude-bodyguard 2>/dev/null || true;
+                     launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1;
+                     launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1"
             if sudo bash -c "$sudo_cmd"; then
                 rm -f "$temp_guard"
-                trap - EXIT
+                trap - EXIT INT TERM
                 echo "OK:保镖守护脚本已同步并重启"
                 return 0
             else
                 rm -f "$temp_guard"
-                trap - EXIT
+                trap - EXIT INT TERM
+                # 失败回滚: 删除可能残留的 .new
+                sudo rm -f "$guard.new" 2>/dev/null || true
                 echo "FAIL:同步失败或被取消"
                 return 1
             fi
         else
             rm -f "$temp_guard"
-            trap - EXIT
+            trap - EXIT INT TERM
             echo "FAIL:无法生成临时保镖脚本"
             return 1
         fi
