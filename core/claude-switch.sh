@@ -982,20 +982,42 @@ log_result() {
 tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
 
 # IPv6 状态检测: 返回 off|on:服务名|unknown:原因
+# fail-closed: 任何探测失败/字段缺失必须返回 unknown
 check_ipv6_status() {
-    local services enabled_services svc v6_info has_public_inet6
-    # 枚举所有网络服务的 IPv6 配置状态
-    services=$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | grep -v '^An asterisk')
-    if [ -z "$services" ]; then
-        echo "unknown:无法列出网络服务"
+    local services enabled_services svc v6_info v6_rc getinfo_output active_iface has_fail
+    # 1. 枚举所有网络服务
+    services=$(networksetup -listallnetworkservices 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$services" ]; then
+        echo "unknown:networksetup列出服务失败"
         return
     fi
+    services=$(echo "$services" | grep -v '^\*' | grep -v '^An asterisk')
+    if [ -z "$services" ]; then
+        echo "unknown:无可用网络服务"
+        return
+    fi
+    
+    # 2. 查找活动网络服务(有默认路由的接口对应的服务)
+    active_iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+    
     enabled_services=""
+    has_fail=0
     while IFS= read -r svc; do
         [ -z "$svc" ] && continue
-        v6_info=$(networksetup -getinfo "$svc" 2>/dev/null | grep -i '^IPv6:')
-        # 服务配置为 Off 才视为已关闭,其他(Automatic/Manual/Link-local)都算启用
-        if [ -n "$v6_info" ] && ! echo "$v6_info" | grep -qi 'off'; then
+        # getinfo 必须成功且包含 IPv6 字段
+        getinfo_output=$(networksetup -getinfo "$svc" 2>/dev/null)
+        v6_rc=$?
+        if [ $v6_rc -ne 0 ]; then
+            echo "unknown:服务[$svc]getinfo失败"
+            return
+        fi
+        v6_info=$(echo "$getinfo_output" | grep -i '^IPv6:')
+        if [ -z "$v6_info" ]; then
+            echo "unknown:服务[$svc]缺失IPv6字段"
+            return
+        fi
+        # Off 才视为已关闭,其他(Automatic/Manual/Link-local only)都算启用
+        if ! echo "$v6_info" | grep -qi 'off'; then
             enabled_services="${enabled_services}${enabled_services:+,}$svc"
         fi
     done <<< "$services"
@@ -1003,21 +1025,25 @@ check_ipv6_status() {
     if [ -n "$enabled_services" ]; then
         echo "on:$enabled_services"
     else
-        # 所有网络服务配置都是 Off,但仍需检查是否有非回环/非隧道的 inet6
-        # 过滤掉 lo0(::1)、utun(ULA)、awdl(link-local fe80)
+        # 所有服务配置 Off,检查物理接口是否有公网 IPv6
+        # ifconfig 必须成功
+        if ! ifconfig >/dev/null 2>&1; then
+            echo "unknown:ifconfig执行失败"
+            return
+        fi
+        # 过滤 lo/utun/awdl/llw 和 fe80/fc/fd
+        local has_public_inet6
         has_public_inet6=$(ifconfig 2>/dev/null | awk '
             /^[a-z]/ { iface=$1; sub(/:$/,"",iface) }
             /inet6/ && iface !~ /^(lo|utun|awdl|llw)/ {
                 addr=$2
-                # 排除 link-local(fe80::) 和 ULA(fc00::/7, fd00::/8)
                 if (addr !~ /^fe80:/ && addr !~ /^fc/ && addr !~ /^fd/) {
-                    print addr
-                    exit
+                    print addr; exit
                 }
             }
         ')
         if [ -n "$has_public_inet6" ]; then
-            echo "on:所有服务显示 Off,但物理接口仍有公网 IPv6($has_public_inet6)"
+            echo "on:所有服务Off但物理接口有公网IPv6($has_public_inet6)"
         else
             echo "off"
         fi
@@ -1488,7 +1514,7 @@ checkdetail() {
     case "$v6_status" in
         off) echo 'IPv6=ok:已关闭' ;;
         on:*) echo "IPv6=fail:${v6_status#on:}" ;;
-        unknown:*) echo "IPv6=warn:${v6_status#unknown:}" ;;
+        unknown:*) echo "IPv6=fail:未验证-${v6_status#unknown:}" ;;  # fail-closed: 未验证必须阻断
     esac
     if check_disabled "DNS"; then
         optional_result "DNS" ok
