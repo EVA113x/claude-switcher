@@ -1706,9 +1706,10 @@ ASEOF
 # 更换代理客户端:改写已安装脚本头部的 PROXY_MODE(用于安装后换客户端/装错客户端)
 set_client() {
     mode="${1:-}"
+    sync="${2:-}"
     case "$mode" in
         clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto) ;;
-        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
+        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto> [--sync]"; return 1 ;;
     esac
     target="${CLAUDE_SWITCHER_CORE:-}"
     if [ -z "$target" ]; then
@@ -1723,11 +1724,66 @@ set_client() {
     grep -q "^PROXY_MODE=\"$mode\"" "$target" || { echo "FAIL:校验失败"; return 1; }
     PROXY_MODE="$mode"
     echo "OK:代理客户端已设为 $mode"
+    
     guard_state=$(bodyguard_status)
     case "$guard_state" in
-        fail:未安装) echo "INFO:保镖尚未安装,checkdetail 会提示未安装" ;;
-        fail:*) echo "WARN:保镖校验未通过(${guard_state#fail:});请重新运行安装器同步 root 守护脚本(需管理员权限),完成前不要启动 Claude" ;;
+        fail:未安装) 
+            echo "INFO:保镖尚未安装,checkdetail 会提示未安装"
+            return 0 ;;
+        ok:*)
+            echo "OK:保镖已同步"
+            return 0 ;;
     esac
+    
+    # 保镖模式不一致,提供同步选项
+    guard="/Library/Application Support/claude-switcher/claude-bodyguard.sh"
+    if [ ! -r "$guard" ]; then
+        echo "WARN:保镖守护脚本不可读(${guard});请重新运行安装器"
+        return 0
+    fi
+    
+    if [ "$sync" = "--sync" ]; then
+        echo ""
+        echo "正在同步保镖守护脚本(需要管理员权限)..."
+        temp_guard=$(mktemp "${TMPDIR:-/tmp}/claude-bodyguard.XXXXXX.sh")
+        if [ -z "$temp_guard" ]; then
+            echo "FAIL:无法创建临时文件"
+            return 1
+        fi
+        trap "rm -f '$temp_guard'" EXIT
+        
+        # 读取现有保镖脚本,只替换 MODE 行
+        if sed "s|^MODE=\"[^\"]*\"|MODE=\"$mode\"|" "$guard" > "$temp_guard"; then
+            chmod 755 "$temp_guard"
+            sudo_cmd="cp '$temp_guard' '$guard' && \
+                     chown root:wheel '$guard' && \
+                     chmod 755 '$guard' && \
+                     /usr/bin/xattr -d com.apple.quarantine '$guard' 2>/dev/null || true && \
+                     launchctl bootout system/local.claude-bodyguard 2>/dev/null || true && \
+                     launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist && \
+                     launchctl print system/local.claude-bodyguard >/dev/null 2>&1"
+            if sudo bash -c "$sudo_cmd"; then
+                rm -f "$temp_guard"
+                trap - EXIT
+                echo "OK:保镖守护脚本已同步并重启"
+                return 0
+            else
+                rm -f "$temp_guard"
+                trap - EXIT
+                echo "FAIL:同步失败或被取消"
+                return 1
+            fi
+        else
+            rm -f "$temp_guard"
+            trap - EXIT
+            echo "FAIL:无法生成临时保镖脚本"
+            return 1
+        fi
+    else
+        echo "WARN:保镖校验未通过(${guard_state#fail:})"
+        echo "INFO:可运行 'claude-switch.sh set-client $mode --sync' 同步保镖(需管理员权限)"
+        echo "INFO:或重新运行安装器完整同步;完成前不要启动 Claude"
+    fi
     echo "INFO:重新运行 checkdetail 生效;非 Clash 客户端请在应用内自行添加 Claude 域名置顶规则"
     return 0
 }
@@ -2575,7 +2631,7 @@ case "$operation" in
     set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode> [--sync]|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
 # checkdetail 分支内部已保存返回码;其他分支取 case 的最终状态。
 # 判断本身会改变 $?，所以必须先捕获 dispatch_rc，再按操作类型落 rc。
