@@ -844,12 +844,14 @@ def assess_probe(policy, expected_ip, output, exit_code):
     try:
         expected = ipaddress.IPv4Address(expected_ip)
     except ValueError:
-        # expected_ip 不是 IPv4: 可能是 IPv6、空值或无效格式
-        # 这不是 STUN 泄漏,而是无法获取可靠的 IPv4 观测进行比对
-        if ":" in expected_ip:
-            # 明确是 IPv6 地址
-            return "warn:出口为 IPv6,STUN 比对需 IPv4 观测,无法验证(非泄漏)"
-        return "warn:未获取有效 IPv4 出口,无法比对 STUN(非探测失败)"
+        # expected_ip 不是 IPv4: 尝试解析为 IPv6 或判定为无效
+        try:
+            ipaddress.IPv6Address(expected_ip)
+            # 确实是 IPv6 地址
+            return "fail:出口为 IPv6,STUN 无法验证 UDP 泄漏,不能放行"
+        except ValueError:
+            # 空值或无效格式
+            return "fail:未获取有效出口 IP,无法验证 STUN,不能放行"
     if output == "RESULT:NONE":
         if policy == "reject":
             return "ok:常见 STUN UDP 拒绝规则已验证，探测无响应"
@@ -981,48 +983,59 @@ tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
 
 # IPv6 状态检测: 返回 off|on:服务名|unknown:原因
 check_ipv6_status() {
-    # 先检查物理接口(en0 等)是否有 inet6 地址
-    if ifconfig 2>/dev/null | grep -q 'inet6 '; then
-        # 有 IPv6 地址,检查哪些网络服务启用了 IPv6
-        local services enabled_services
-        services=$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | grep -v '^An asterisk')
-        if [ -z "$services" ]; then
-            echo "on:物理接口有 inet6,但无法列出网络服务"
-            return
+    local services enabled_services svc v6_info has_public_inet6
+    # 枚举所有网络服务的 IPv6 配置状态
+    services=$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | grep -v '^An asterisk')
+    if [ -z "$services" ]; then
+        echo "unknown:无法列出网络服务"
+        return
+    fi
+    enabled_services=""
+    while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        v6_info=$(networksetup -getinfo "$svc" 2>/dev/null | grep -i '^IPv6:')
+        # 服务配置为 Off 才视为已关闭,其他(Automatic/Manual/Link-local)都算启用
+        if [ -n "$v6_info" ] && ! echo "$v6_info" | grep -qi 'off'; then
+            enabled_services="${enabled_services}${enabled_services:+,}$svc"
         fi
-        enabled_services=""
-        while IFS= read -r svc; do
-            [ -z "$svc" ] && continue
-            v6_info=$(networksetup -getinfo "$svc" 2>/dev/null | grep -i '^IPv6:')
-            if [ -n "$v6_info" ] && ! echo "$v6_info" | grep -qi 'off'; then
-                enabled_services="${enabled_services}${enabled_services:+,}$svc"
-            fi
-        done <<< "$services"
-        if [ -n "$enabled_services" ]; then
-            echo "on:$enabled_services"
-        else
-            echo "on:物理接口有 inet6,但网络服务显示 Off(UI 可能不同步)"
-        fi
+    done <<< "$services"
+    
+    if [ -n "$enabled_services" ]; then
+        echo "on:$enabled_services"
     else
-        # 无 inet6 地址,认为已关闭
-        echo "off"
+        # 所有网络服务配置都是 Off,但仍需检查是否有非回环/非隧道的 inet6
+        # 过滤掉 lo0(::1)、utun(ULA)、awdl(link-local fe80)
+        has_public_inet6=$(ifconfig 2>/dev/null | awk '
+            /^[a-z]/ { iface=$1; sub(/:$/,"",iface) }
+            /inet6/ && iface !~ /^(lo|utun|awdl|llw)/ {
+                addr=$2
+                # 排除 link-local(fe80::) 和 ULA(fc00::/7, fd00::/8)
+                if (addr !~ /^fe80:/ && addr !~ /^fc/ && addr !~ /^fd/) {
+                    print addr
+                    exit
+                }
+            }
+        ')
+        if [ -n "$has_public_inet6" ]; then
+            echo "on:所有服务显示 Off,但物理接口仍有公网 IPv6($has_public_inet6)"
+        else
+            echo "off"
+        fi
     fi
 }
 
-# 获取启用了 IPv6 的网络服务名(空格分隔,服务名可能含空格)
+# 获取启用了 IPv6 的网络服务名(NUL分隔,安全处理空格/引号)
 get_ipv6_enabled_services() {
-    local services svc v6_info result
+    local services svc v6_info
     services=$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | grep -v '^An asterisk')
-    result=""
     while IFS= read -r svc; do
         [ -z "$svc" ] && continue
         v6_info=$(networksetup -getinfo "$svc" 2>/dev/null | grep -i '^IPv6:')
         if [ -n "$v6_info" ] && ! echo "$v6_info" | grep -qi 'off'; then
-            # 服务名可能含空格,用换行分隔
-            result="${result}${svc}"$'\n'
+            # 用 NUL 分隔服务名,避免空格/引号问题
+            printf '%s\0' "$svc"
         fi
     done <<< "$services"
-    echo "$result"
 }
 
 # 代理客户端显示名(供检查细节输出)
@@ -1286,7 +1299,7 @@ check() {
     case "$v6_status" in
         off) ;;  # IPv6 已关闭,通过
         on:*) fails="$fails;IPv6未关闭(${v6_status#on:})" ;;
-        unknown:*) ;;  # 无法确定,不作为失败(可能无网络服务)
+        unknown:*) fails="$fails;IPv6状态未知(${v6_status#unknown:})" ;;  # fail-closed: 无法确认必须阻断
     esac
 
     if ! check_disabled "DNS"; then
@@ -1684,15 +1697,19 @@ fix() {
     v6_status=$(check_ipv6_status)
     adminCmds=""
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
-    # IPv6 关闭: 仅当明确检测到启用时才关闭(获取实际服务名)
+    # IPv6 关闭: 仅当明确检测到启用时才关闭(获取实际服务名,安全引用)
     case "$v6_status" in
         on:*)
-            v6_services=$(get_ipv6_enabled_services)
-            if [ -n "$v6_services" ]; then
-                for svc in $v6_services; do
-                    adminCmds="${adminCmds}networksetup -setv6off '$svc'; "
-                done
-            fi ;;
+            # get_ipv6_enabled_services 返回 NUL 分隔的服务名
+            while IFS= read -r -d '' svc; do
+                # 验证服务名非空且不含危险字符
+                if [ -n "$svc" ] && ! echo "$svc" | grep -q '[;&|$`]'; then
+                    # 用单引号包裹,转义内部单引号为 '\''
+                    safe_svc=$(printf '%s' "$svc" | sed "s/'/'\\\\\''/g")
+                    adminCmds="${adminCmds}networksetup -setv6off '${safe_svc}'; "
+                fi
+            done < <(get_ipv6_enabled_services)
+            ;;
     esac
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         adminCmds="${adminCmds}cp -X $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ || exit 1; /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist 2>/dev/null || true; chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1; "
