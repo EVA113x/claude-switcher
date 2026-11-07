@@ -143,28 +143,90 @@ locale_for() {
 # ---- 0. 前置检查 ----
 CLASH_DIR="$H/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 FLCLASH_DIR="$H/Library/Application Support/com.follow.clash"
-if [ -d "$CLASH_DIR" ]; then
-    MODE="clash-verge"
-elif [ -d "$FLCLASH_DIR" ]; then
-    MODE="flclash"
-elif scutil --nc list 2>/dev/null | grep -q 'com.liguangming.Shadowrocket'; then
-    MODE="shadowrocket"
-else
-    echo "未自动识别到代理客户端,请手动选择:"
-    echo "  1) clash-verge    2) flclash         3) shadowrocket"
-    echo "  4) sing-box       5) clashx          6) surge"
-    echo "  7) auto(任一命中即活)"
-    read -r -p "请输入序号或名称: " pick
-    case "$pick" in
-        1|clash-verge)  MODE="clash-verge" ;;
-        2|flclash)      MODE="flclash" ;;
-        3|shadowrocket)  MODE="shadowrocket" ;;
-        4|sing-box)      MODE="sing-box" ;;
-        5|clashx)        MODE="clashx" ;;
-        6|surge)         MODE="surge" ;;
-        7|auto)          MODE="auto" ;;
-        *) echo "未识别的选择,退出"; exit 1 ;;
+
+# 多阶段检测: 1)环境变量强制指定 2)检测运行中的客户端 3)检测配置目录存在 4)手动选择
+if [ -n "${CLAUDE_PROXY_CLIENT:-}" ]; then
+    case "$CLAUDE_PROXY_CLIENT" in
+        clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto)
+            MODE="$CLAUDE_PROXY_CLIENT"
+            echo "ℹ️  已从环境变量 CLAUDE_PROXY_CLIENT 强制指定: $MODE" ;;
+        *) echo "❌ 环境变量 CLAUDE_PROXY_CLIENT 值无效: $CLAUDE_PROXY_CLIENT"; exit 1 ;;
     esac
+else
+    # 检测运行中的客户端进程(优先级高于仅存在配置目录)
+    RUNNING_CLIENTS=""
+    pgrep -f 'verge-mihomo' >/dev/null 2>&1 && RUNNING_CLIENTS="${RUNNING_CLIENTS}clash-verge "
+    { pgrep -f 'FlClashCore' >/dev/null 2>&1 || pgrep -x 'FlClash' >/dev/null 2>&1; } && RUNNING_CLIENTS="${RUNNING_CLIENTS}flclash "
+    scutil --nc list 2>/dev/null | grep 'com.liguangming.Shadowrocket' | grep -q '(Connected)' && RUNNING_CLIENTS="${RUNNING_CLIENTS}shadowrocket "
+    pgrep -f 'sing-box' >/dev/null 2>&1 && RUNNING_CLIENTS="${RUNNING_CLIENTS}sing-box "
+    { pgrep -x 'ClashX' >/dev/null 2>&1 || pgrep -f 'clash' >/dev/null 2>&1; } && RUNNING_CLIENTS="${RUNNING_CLIENTS}clashx "
+    pgrep -f 'Surge' >/dev/null 2>&1 && RUNNING_CLIENTS="${RUNNING_CLIENTS}surge "
+    
+    RUNNING_COUNT=$(echo "$RUNNING_CLIENTS" | wc -w | tr -d ' ')
+    
+    if [ "$RUNNING_COUNT" -eq 1 ]; then
+        MODE=$(echo "$RUNNING_CLIENTS" | xargs)
+        echo "✓ 检测到运行中的代理客户端: $MODE"
+    elif [ "$RUNNING_COUNT" -gt 1 ]; then
+        echo ""
+        echo "检测到多个运行中的代理客户端,请选择用于 Claude 的那个:"
+        i=1
+        for c in $RUNNING_CLIENTS; do echo "  $i) $c"; i=$((i+1)); done
+        read -r -p "请输入序号: " pick
+        case "$pick" in ''|*[!0-9]*) echo "输入无效,退出"; exit 1 ;; esac
+        if [ "$pick" -lt 1 ] || [ "$pick" -gt "$RUNNING_COUNT" ]; then
+            echo "序号超范围,退出"; exit 1
+        fi
+        MODE=$(echo "$RUNNING_CLIENTS" | xargs | cut -d' ' -f"$pick")
+        echo "✓ 已选择: $MODE"
+    else
+        # 没有运行中的客户端,回退到检测配置目录
+        CONFIG_CLIENTS=""
+        [ -d "$CLASH_DIR" ] && CONFIG_CLIENTS="${CONFIG_CLIENTS}clash-verge "
+        [ -d "$FLCLASH_DIR" ] && CONFIG_CLIENTS="${CONFIG_CLIENTS}flclash "
+        scutil --nc list 2>/dev/null | grep -q 'com.liguangming.Shadowrocket' && CONFIG_CLIENTS="${CONFIG_CLIENTS}shadowrocket "
+        
+        CONFIG_COUNT=$(echo "$CONFIG_CLIENTS" | wc -w | tr -d ' ')
+        
+        if [ "$CONFIG_COUNT" -eq 1 ]; then
+            MODE=$(echo "$CONFIG_CLIENTS" | xargs)
+            echo "⚠️  检测到配置目录但客户端未运行: $MODE"
+            echo "   请先启动代理客户端并确认 TUN 模式已开启"
+            read -n 1 -s -r -p "按任意键继续安装(或 Ctrl+C 取消)..."
+            echo ""
+        elif [ "$CONFIG_COUNT" -gt 1 ]; then
+            echo ""
+            echo "检测到多个代理客户端的配置目录(但均未运行),请选择要使用的:"
+            i=1
+            for c in $CONFIG_CLIENTS; do echo "  $i) $c"; i=$((i+1)); done
+            read -r -p "请输入序号: " pick
+            case "$pick" in ''|*[!0-9]*) echo "输入无效,退出"; exit 1 ;; esac
+            if [ "$pick" -lt 1 ] || [ "$pick" -gt "$CONFIG_COUNT" ]; then
+                echo "序号超范围,退出"; exit 1
+            fi
+            MODE=$(echo "$CONFIG_CLIENTS" | xargs | cut -d' ' -f"$pick")
+            echo "✓ 已选择: $MODE (请确保启动后再使用切换器)"
+        else
+            # 完全未检测到,手动选择
+            echo ""
+            echo "未自动识别到代理客户端,请手动选择:"
+            echo "  1) clash-verge    2) flclash         3) shadowrocket"
+            echo "  4) sing-box       5) clashx          6) surge"
+            echo "  7) auto(任一命中即活)"
+            read -r -p "请输入序号或名称: " pick
+            case "$pick" in
+                1|clash-verge)  MODE="clash-verge" ;;
+                2|flclash)      MODE="flclash" ;;
+                3|shadowrocket)  MODE="shadowrocket" ;;
+                4|sing-box)      MODE="sing-box" ;;
+                5|clashx)        MODE="clashx" ;;
+                6|surge)         MODE="surge" ;;
+                7|auto)          MODE="auto" ;;
+                *) echo "未识别的选择,退出"; exit 1 ;;
+            esac
+            echo "✓ 代理客户端: $MODE (请确保已安装并启动)"
+        fi
+    fi
 fi
 echo "✓ 代理客户端: $MODE"
 if [ ! -d /Applications/Claude.app ]; then
@@ -373,9 +435,7 @@ else
         cp '$STAGE/claude-bodyguard.sh' '$STAGE/tz-watchdog.sh' '/Library/Application Support/claude-switcher/' || exit 1;
         chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' || exit 1;
         chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' || exit 1;
-        /usr/bin/xattr -d com.apple.quarantine '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' 2>/dev/null || true;
         cp -X '$H/.local/bin/local.claude-bodyguard.plist' '$H/.local/bin/local.tz-watchdog.plist' /Library/LaunchDaemons/ || exit 1;
-        /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist 2>/dev/null || true;
         chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist || exit 1;
         chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist || exit 1;
         launchctl bootout system/local.claude-bodyguard 2>/dev/null || true; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1;
@@ -383,18 +443,15 @@ else
         launchctl bootout system/local.claude-update 2>/dev/null; rm -f /Library/LaunchDaemons/local.claude-update.plist;"
     curt=$(readlink /etc/localtime 2>/dev/null)
     [ "$curt" != "/var/db/timezone/zoneinfo/$TZV" ] && SYSCMDS="$SYSCMDS /usr/sbin/systemsetup -settimezone '$TZV';"
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || SYSCMDS="$SYSCMDS networksetup -setv6off Wi-Fi;"
     SYSCMDS="$SYSCMDS dscacheutil -flushcache; killall -HUP mDNSResponder"
     echo ""
-    echo "接下来需要输入一次开机密码,用于: 安装守护进程(系统目录) + 锁定时区($TZV) + 关闭IPv6"
+    echo "接下来需要输入一次开机密码,用于: 安装守护进程(系统目录) + 锁定时区($TZV)"
     sudo bash -c "$SYSCMDS" && echo "✓ 系统级配置完成" || echo "✗ 系统级配置被取消,可稍后重新运行安装程序"
     rm -rf "$STAGE"
 
     # 自动更新:用户态 LaunchAgent(每12小时),不走 root,降低供应链风险
     mkdir -p "$H/Library/LaunchAgents"
     cp -X "$H/.local/bin/local.claude-update.plist" "$H/Library/LaunchAgents/local.claude-update.plist"
-    /usr/bin/xattr -d com.apple.quarantine "$H/Library/LaunchAgents/local.claude-update.plist" 2>/dev/null || true
     launchctl bootout "gui/$(id -u)/local.claude-update" 2>/dev/null
     if launchctl bootstrap "gui/$(id -u)" "$H/Library/LaunchAgents/local.claude-update.plist" 2>/dev/null; then
         echo "✓ 自动更新服务已注册(每12小时检查一次)"

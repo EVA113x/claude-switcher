@@ -840,10 +840,18 @@ def write_changes(changes):
 def assess_probe(policy, expected_ip, output, exit_code):
     if exit_code != "0":
         return "fail:STUN 探测执行失败，未确认 UDP 出口"
+    # 验证 expected_ip 是否为有效 IPv4(STUN 仅支持 IPv4)
     try:
         expected = ipaddress.IPv4Address(expected_ip)
     except ValueError:
-        return "fail:未获取有效的 IPv4 出口，无法比对 STUN 结果"
+        # expected_ip 不是 IPv4: 尝试解析为 IPv6 或判定为无效
+        try:
+            ipaddress.IPv6Address(expected_ip)
+            # 确实是 IPv6 地址
+            return "fail:出口为 IPv6,STUN 无法验证 UDP 泄漏,不能放行"
+        except ValueError:
+            # 空值或无效格式
+            return "fail:未获取有效出口 IP,无法验证 STUN,不能放行"
     if output == "RESULT:NONE":
         if policy == "reject":
             return "ok:常见 STUN UDP 拒绝规则已验证，探测无响应"
@@ -972,6 +980,168 @@ log_result() {
 
 # TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管(兼容各种 TUN 设备名)
 tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
+
+# IPv6 状态检测: 返回 off|on:服务名|unknown:原因
+# fail-closed: 任何探测失败/字段缺失必须返回 unknown
+# 只检查活动网络服务,闲置服务不应导致误报
+# 只读函数,不写任何文件
+check_ipv6_status() {
+    local service_order active_services svc_name svc_iface v6_info getinfo_output enabled_services has_active_inet6
+    
+    # 1. 获取网络服务顺序
+    service_order=$(networksetup -listnetworkserviceorder 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$service_order" ]; then
+        echo "unknown:无法获取网络服务顺序"
+        return
+    fi
+    
+    # 2. ifconfig 必须成功
+    if ! ifconfig >/dev/null 2>&1; then
+        echo "unknown:ifconfig执行失败"
+        return
+    fi
+    
+    # 3. 提取物理接口及状态(Bash 3.2 兼容,避免管道子shell)
+    # 格式: 服务名|接口|是否有IP
+    active_services=$(echo "$service_order" | awk '
+        /^\([0-9]+\)/ {
+            gsub(/^\([0-9]+\) /, "")
+            svc = $0
+            getline
+            if ($0 ~ /Device: [a-z0-9]+\)/) {
+                sub(/.*Device: /, "")
+                sub(/\).*/, "")
+                iface = $0
+                # 过滤虚拟接口
+                if (iface !~ /^(lo|utun|awdl|llw|bridge|gif|stf|p2p)/) {
+                    print svc "|" iface
+                }
+            }
+        }
+    ')
+    
+    if [ -z "$active_services" ]; then
+        echo "unknown:无法解析网络服务映射"
+        return
+    fi
+    
+    # 4. 过滤出有 IP 的活动接口(避免管道子shell,用命令替换)
+    local active_filtered=""
+    local line
+    while IFS='|' read -r svc_name svc_iface; do
+        [ -z "$svc_name" ] && continue
+        # 检查接口是否有 inet 地址(IPv4,活动标志)
+        if ifconfig "$svc_iface" 2>/dev/null | grep -q 'inet '; then
+            active_filtered="${active_filtered}${svc_name}|${svc_iface}"$'\n'
+        fi
+    done <<EOF
+$active_services
+EOF
+    
+    if [ -z "$active_filtered" ]; then
+        echo "unknown:无活动网络接口"
+        return
+    fi
+    
+    # 5. 检查活动接口的 IPv6 配置(避免管道子shell)
+    enabled_services=""
+    has_active_inet6=""
+    while IFS='|' read -r svc_name svc_iface; do
+        [ -z "$svc_name" ] && continue
+        
+        # getinfo 必须成功且包含 IPv6 字段
+        getinfo_output=$(networksetup -getinfo "$svc_name" 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            echo "unknown:服务[$svc_name]getinfo失败"
+            return
+        fi
+        v6_info=$(echo "$getinfo_output" | grep -i '^IPv6:')
+        if [ -z "$v6_info" ]; then
+            echo "unknown:服务[$svc_name]缺失IPv6字段"
+            return
+        fi
+        
+        # Off 才视为已关闭
+        if ! echo "$v6_info" | grep -qi 'off'; then
+            enabled_services="${enabled_services}${enabled_services:+,}$svc_name"
+        fi
+        
+        # 检查该接口是否有公网 IPv6(排除 fe80/fc/fd)
+        if [ -z "$has_active_inet6" ]; then
+            has_active_inet6=$(ifconfig "$svc_iface" 2>/dev/null | awk '
+                /inet6/ {
+                    addr=$2
+                    if (addr !~ /^fe80:/ && addr !~ /^fc/ && addr !~ /^fd/) {
+                        print addr
+                        exit
+                    }
+                }
+            ')
+        fi
+    done <<EOF
+$active_filtered
+EOF
+    
+    # 6. 判断最终状态
+    if [ -n "$enabled_services" ]; then
+        echo "on:$enabled_services"
+    elif [ -n "$has_active_inet6" ]; then
+        echo "on:活动接口有公网IPv6($has_active_inet6)"
+    else
+        echo "off"
+    fi
+}
+
+# 获取启用了 IPv6 的活动网络服务名(NUL分隔,安全处理空格/引号)
+# 只返回活动物理服务,不包括闲置服务
+# 只读函数,不写文件
+get_ipv6_enabled_services() {
+    local service_order all_mappings active_filtered svc_name svc_iface v6_info
+    
+    service_order=$(networksetup -listnetworkserviceorder 2>/dev/null)
+    [ $? -ne 0 ] && return
+    
+    ifconfig >/dev/null 2>&1 || return
+    
+    # 提取服务名|接口映射(Bash 3.2 兼容)
+    all_mappings=$(echo "$service_order" | awk '
+        /^\([0-9]+\)/ {
+            gsub(/^\([0-9]+\) /, "")
+            svc = $0
+            getline
+            if ($0 ~ /Device: [a-z0-9]+\)/) {
+                sub(/.*Device: /, "")
+                sub(/\).*/, "")
+                iface = $0
+                if (iface !~ /^(lo|utun|awdl|llw|bridge|gif|stf|p2p)/) {
+                    print svc "|" iface
+                }
+            }
+        }
+    ')
+    
+    # 过滤出有 inet 的活动接口(避免管道子shell)
+    active_filtered=""
+    while IFS='|' read -r svc_name svc_iface; do
+        [ -z "$svc_name" ] && continue
+        if ifconfig "$svc_iface" 2>/dev/null | grep -q 'inet '; then
+            active_filtered="${active_filtered}${svc_name}|${svc_iface}"$'\n'
+        fi
+    done <<EOF
+$all_mappings
+EOF
+    
+    # 输出启用 IPv6 的活动服务(NUL分隔)
+    while IFS='|' read -r svc_name svc_iface; do
+        [ -z "$svc_name" ] && continue
+        v6_info=$(networksetup -getinfo "$svc_name" 2>/dev/null | grep -i '^IPv6:')
+        if [ -n "$v6_info" ] && ! echo "$v6_info" | grep -qi 'off'; then
+            printf '%s\0' "$svc_name"
+        fi
+    done <<EOF
+$active_filtered
+EOF
+}
 
 # 代理客户端显示名(供检查细节输出)
 proxy_name() {
@@ -1229,8 +1399,13 @@ check() {
     locale=$(defaults read -g AppleLocale 2>/dev/null)
     [ "$locale" = "$LOCALE_TARGET" ] || fails="$fails;地区异常($locale)"
 
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || fails="$fails;IPv6未关闭"
+    # IPv6 检测: 查询所有活动网络服务(不硬编码服务名)
+    v6_status=$(check_ipv6_status)
+    case "$v6_status" in
+        off) ;;  # IPv6 已关闭,通过
+        on:*) fails="$fails;IPv6未关闭(${v6_status#on:})" ;;
+        unknown:*) fails="$fails;IPv6状态未知(${v6_status#unknown:})" ;;  # fail-closed: 无法确认必须阻断
+    esac
 
     if ! check_disabled "DNS"; then
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
@@ -1380,7 +1555,12 @@ checkdetail() {
         echo "代理内核=fail:$(proxy_name) 未运行"
     fi
     if tun_up; then echo 'TUN网卡=ok'; else echo 'TUN网卡=fail:不在线'; fi
-    trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    # 优先获取 IPv4 地址(用于 STUN 比对),回退到任意地址族
+    trace=$(curl -4 -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    if [ -z "$trace" ] || ! echo "$trace" | grep -q '^ip='; then
+        # IPv4 失败,尝试不限制地址族
+        trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    fi
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     if [ "$loc" = "$COUNTRY_TARGET" ]; then echo "出口IP=ok:$ip/$loc"; else echo "出口IP=fail:${ip:-无}/${loc:-未知}(期望$COUNTRY_TARGET)"; fi
@@ -1409,8 +1589,12 @@ checkdetail() {
     if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo '时区=ok'; else echo "时区=fail:$tz"; fi
     locale=$(defaults read -g AppleLocale 2>/dev/null)
     if [ "$locale" = "$LOCALE_TARGET" ]; then echo '地区=ok'; else echo "地区=fail:$locale"; fi
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭'; fi
+    v6_status=$(check_ipv6_status)
+    case "$v6_status" in
+        off) echo 'IPv6=ok:已关闭' ;;
+        on:*) echo "IPv6=fail:${v6_status#on:}" ;;
+        unknown:*) echo "IPv6=fail:未验证-${v6_status#unknown:}" ;;  # fail-closed: 未验证必须阻断
+    esac
     if check_disabled "DNS"; then
         optional_result "DNS" ok
     else
@@ -1615,10 +1799,23 @@ fix() {
 
     # B. 时区/IPv6/DNS缓存/保镖(需管理员权限,会弹一次密码框)
     tz=$(readlink /etc/localtime 2>/dev/null)
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
+    v6_status=$(check_ipv6_status)
     adminCmds=""
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
-    echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
+    # IPv6 关闭: 仅当明确检测到启用时才关闭(获取实际服务名,安全引用)
+    case "$v6_status" in
+        on:*)
+            # get_ipv6_enabled_services 返回 NUL 分隔的服务名
+            while IFS= read -r -d '' svc; do
+                # 验证服务名非空且不含危险字符
+                if [ -n "$svc" ] && ! echo "$svc" | grep -q '[;&|$`]'; then
+                    # 用单引号包裹,转义内部单引号为 '\''
+                    safe_svc=$(printf '%s' "$svc" | sed "s/'/'\\\\\''/g")
+                    adminCmds="${adminCmds}networksetup -setv6off '${safe_svc}'; "
+                fi
+            done < <(get_ipv6_enabled_services)
+            ;;
+    esac
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         adminCmds="${adminCmds}cp -X $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ || exit 1; /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist 2>/dev/null || true; chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1; "
     fi
@@ -1706,9 +1903,10 @@ ASEOF
 # 更换代理客户端:改写已安装脚本头部的 PROXY_MODE(用于安装后换客户端/装错客户端)
 set_client() {
     mode="${1:-}"
+    sync="${2:-}"
     case "$mode" in
         clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto) ;;
-        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
+        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto> [--sync]"; return 1 ;;
     esac
     target="${CLAUDE_SWITCHER_CORE:-}"
     if [ -z "$target" ]; then
@@ -1723,11 +1921,79 @@ set_client() {
     grep -q "^PROXY_MODE=\"$mode\"" "$target" || { echo "FAIL:校验失败"; return 1; }
     PROXY_MODE="$mode"
     echo "OK:代理客户端已设为 $mode"
+    
     guard_state=$(bodyguard_status)
+    guard="/Library/Application Support/claude-switcher/claude-bodyguard.sh"
+    
+    # 保镖已同步或未安装时的处理
     case "$guard_state" in
-        fail:未安装) echo "INFO:保镖尚未安装,checkdetail 会提示未安装" ;;
-        fail:*) echo "WARN:保镖校验未通过(${guard_state#fail:});请重新运行安装器同步 root 守护脚本(需管理员权限),完成前不要启动 Claude" ;;
+        ok:*)
+            echo "OK:保镖已同步"
+            return 0 ;;
+        fail:未安装)
+            if [ "$sync" != "--sync" ]; then
+                echo "INFO:保镖尚未安装,checkdetail 会提示未安装"
+                return 0
+            fi
+            # --sync 但保镖未安装,拒绝操作(必须先运行安装器完整安装)
+            echo "FAIL:保镖尚未安装,--sync 只能更新现有保镖"
+            echo "INFO:请先运行安装器完成初始安装,再使用 --sync 切换客户端"
+            return 1 ;;
     esac
+    
+    # 保镖模式不一致,提供同步选项
+    if [ ! -r "$guard" ]; then
+        echo "WARN:保镖守护脚本不可读(${guard});请重新运行安装器"
+        return 0
+    fi
+    
+    if [ "$sync" = "--sync" ]; then
+        echo ""
+        echo "正在同步保镖守护脚本(需要管理员权限)..."
+        temp_guard=$(mktemp "${TMPDIR:-/tmp}/claude-bodyguard.XXXXXX.sh")
+        if [ -z "$temp_guard" ]; then
+            echo "FAIL:无法创建临时文件"
+            return 1
+        fi
+        trap "rm -f '$temp_guard'" EXIT INT TERM
+        
+        # 读取现有保镖脚本,只替换 MODE 行(输入已在 case 验证,sed 模式不含用户输入)
+        if sed "s|^MODE=\"[^\"]*\"|MODE=\"$mode\"|" "$guard" > "$temp_guard"; then
+            chmod 755 "$temp_guard"
+            # 原子写入: 先写临时位置,校验后原子 mv(同文件系统内原子)
+            sudo_cmd="set -e;
+                     cp '$temp_guard' '$guard.new' || exit 1;
+                     chown root:wheel '$guard.new' || exit 1;
+                     chmod 755 '$guard.new' || exit 1;
+                     grep -q '^MODE=\"$mode\"' '$guard.new' || exit 1;
+                     mv -f '$guard.new' '$guard' || exit 1;
+                     launchctl bootout system/local.claude-bodyguard 2>/dev/null || true;
+                     launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1;
+                     launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1"
+            if sudo bash -c "$sudo_cmd"; then
+                rm -f "$temp_guard"
+                trap - EXIT INT TERM
+                echo "OK:保镖守护脚本已同步并重启"
+                return 0
+            else
+                rm -f "$temp_guard"
+                trap - EXIT INT TERM
+                # 失败回滚: 删除可能残留的 .new
+                sudo rm -f "$guard.new" 2>/dev/null || true
+                echo "FAIL:同步失败或被取消"
+                return 1
+            fi
+        else
+            rm -f "$temp_guard"
+            trap - EXIT INT TERM
+            echo "FAIL:无法生成临时保镖脚本"
+            return 1
+        fi
+    else
+        echo "WARN:保镖校验未通过(${guard_state#fail:})"
+        echo "INFO:可运行 'claude-switch.sh set-client $mode --sync' 同步保镖(需管理员权限)"
+        echo "INFO:或重新运行安装器完整同步;完成前不要启动 Claude"
+    fi
     echo "INFO:重新运行 checkdetail 生效;非 Clash 客户端请在应用内自行添加 Claude 域名置顶规则"
     return 0
 }
@@ -2575,7 +2841,7 @@ case "$operation" in
     set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode> [--sync]|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
 # checkdetail 分支内部已保存返回码;其他分支取 case 的最终状态。
 # 判断本身会改变 $?，所以必须先捕获 dispatch_rc，再按操作类型落 rc。
