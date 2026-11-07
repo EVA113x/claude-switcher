@@ -983,73 +983,75 @@ tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
 
 # IPv6 状态检测: 返回 off|on:服务名|unknown:原因
 # fail-closed: 任何探测失败/字段缺失必须返回 unknown
-# 只检查活动网络服务,闲置服务(Thunderbolt/iPhone USB)不应导致误报
+# 只检查活动网络服务,闲置服务不应导致误报
+# 只读函数,不写任何文件
 check_ipv6_status() {
-    local service_order active_services svc svc_iface svc_status v6_info v6_rc getinfo_output enabled_services
+    local service_order active_services svc_name svc_iface v6_info getinfo_output enabled_services has_active_inet6
     
-    # 1. 获取网络服务顺序及接口映射(必须成功)
+    # 1. 获取网络服务顺序
     service_order=$(networksetup -listnetworkserviceorder 2>/dev/null)
     if [ $? -ne 0 ] || [ -z "$service_order" ]; then
         echo "unknown:无法获取网络服务顺序"
         return
     fi
     
-    # 2. 解析活动服务: 提取 (Hardware Port: xxx, Device: enX) 的服务名和接口
-    # 格式: (1) Service Name
-    #       (Hardware Port: xxx, Device: en0)
-    # Bash 3.2 兼容: 不使用 match 数组捕获
+    # 2. ifconfig 必须成功
+    if ! ifconfig >/dev/null 2>&1; then
+        echo "unknown:ifconfig执行失败"
+        return
+    fi
+    
+    # 3. 提取物理接口及状态(Bash 3.2 兼容,避免管道子shell)
+    # 格式: 服务名|接口|是否有IP
     active_services=$(echo "$service_order" | awk '
         /^\([0-9]+\)/ {
             gsub(/^\([0-9]+\) /, "")
-            svc_name = $0
+            svc = $0
             getline
-            # 提取 Device: xxx)
             if ($0 ~ /Device: [a-z0-9]+\)/) {
-                # 删除 Device: 前的所有内容
                 sub(/.*Device: /, "")
-                # 删除末尾的 )
                 sub(/\).*/, "")
                 iface = $0
                 # 过滤虚拟接口
                 if (iface !~ /^(lo|utun|awdl|llw|bridge|gif|stf|p2p)/) {
-                    print svc_name "|" iface
+                    print svc "|" iface
                 }
             }
         }
     ')
     
     if [ -z "$active_services" ]; then
-        echo "unknown:无法解析活动网络服务"
+        echo "unknown:无法解析网络服务映射"
         return
     fi
     
-    # 3. 检查活动物理接口是否有公网 IPv6
-    if ! ifconfig >/dev/null 2>&1; then
-        echo "unknown:ifconfig执行失败"
+    # 4. 过滤出有 IP 的活动接口(避免管道子shell,用命令替换)
+    local active_filtered=""
+    local line
+    while IFS='|' read -r svc_name svc_iface; do
+        [ -z "$svc_name" ] && continue
+        # 检查接口是否有 inet 地址(IPv4,活动标志)
+        if ifconfig "$svc_iface" 2>/dev/null | grep -q 'inet '; then
+            active_filtered="${active_filtered}${svc_name}|${svc_iface}"$'\n'
+        fi
+    done <<EOF
+$active_services
+EOF
+    
+    if [ -z "$active_filtered" ]; then
+        echo "unknown:无活动网络接口"
         return
     fi
     
-    local has_public_inet6_on_active
-    has_public_inet6_on_active=$(echo "$active_services" | while IFS='|' read -r svc_name svc_iface; do
-        ifconfig "$svc_iface" 2>/dev/null | awk -v iface="$svc_iface" '
-            /inet6/ {
-                addr=$2
-                # 排除 link-local(fe80) 和 ULA(fc/fd)
-                if (addr !~ /^fe80:/ && addr !~ /^fc/ && addr !~ /^fd/) {
-                    print iface ":" addr
-                    exit
-                }
-            }
-        '
-    done | head -1)
-    
-    # 4. 检查活动服务的 IPv6 配置
+    # 5. 检查活动接口的 IPv6 配置(避免管道子shell)
     enabled_services=""
-    echo "$active_services" | while IFS='|' read -r svc_name svc_iface; do
+    has_active_inet6=""
+    while IFS='|' read -r svc_name svc_iface; do
+        [ -z "$svc_name" ] && continue
+        
         # getinfo 必须成功且包含 IPv6 字段
         getinfo_output=$(networksetup -getinfo "$svc_name" 2>/dev/null)
-        v6_rc=$?
-        if [ $v6_rc -ne 0 ]; then
+        if [ $? -ne 0 ]; then
             echo "unknown:服务[$svc_name]getinfo失败"
             return
         fi
@@ -1058,65 +1060,87 @@ check_ipv6_status() {
             echo "unknown:服务[$svc_name]缺失IPv6字段"
             return
         fi
+        
         # Off 才视为已关闭
         if ! echo "$v6_info" | grep -qi 'off'; then
             enabled_services="${enabled_services}${enabled_services:+,}$svc_name"
         fi
-    done > "$HOME/.claude-switcher/.ipv6check.tmp" 2>&1
-    
-    # 5. 读取检查结果
-    if [ -f "$HOME/.claude-switcher/.ipv6check.tmp" ]; then
-        local check_result
-        check_result=$(cat "$HOME/.claude-switcher/.ipv6check.tmp")
-        rm -f "$HOME/.claude-switcher/.ipv6check.tmp"
-        if echo "$check_result" | grep -q "^unknown:"; then
-            echo "$check_result"
-            return
+        
+        # 检查该接口是否有公网 IPv6(排除 fe80/fc/fd)
+        if [ -z "$has_active_inet6" ]; then
+            has_active_inet6=$(ifconfig "$svc_iface" 2>/dev/null | awk '
+                /inet6/ {
+                    addr=$2
+                    if (addr !~ /^fe80:/ && addr !~ /^fc/ && addr !~ /^fd/) {
+                        print addr
+                        exit
+                    }
+                }
+            ')
         fi
-        enabled_services="$check_result"
-    fi
+    done <<EOF
+$active_filtered
+EOF
     
     # 6. 判断最终状态
     if [ -n "$enabled_services" ]; then
         echo "on:$enabled_services"
-    elif [ -n "$has_public_inet6_on_active" ]; then
-        echo "on:活动接口有公网IPv6($has_public_inet6_on_active)"
+    elif [ -n "$has_active_inet6" ]; then
+        echo "on:活动接口有公网IPv6($has_active_inet6)"
     else
         echo "off"
     fi
 }
 
 # 获取启用了 IPv6 的活动网络服务名(NUL分隔,安全处理空格/引号)
-# 只返回活动物理服务,不包括闲置的 Thunderbolt/iPhone USB
+# 只返回活动物理服务,不包括闲置服务
+# 只读函数,不写文件
 get_ipv6_enabled_services() {
-    local service_order active_services svc_name v6_info
+    local service_order all_mappings active_filtered svc_name svc_iface v6_info
+    
     service_order=$(networksetup -listnetworkserviceorder 2>/dev/null)
     [ $? -ne 0 ] && return
     
-    # 提取活动物理服务(Bash 3.2 兼容)
-    active_services=$(echo "$service_order" | awk '
+    ifconfig >/dev/null 2>&1 || return
+    
+    # 提取服务名|接口映射(Bash 3.2 兼容)
+    all_mappings=$(echo "$service_order" | awk '
         /^\([0-9]+\)/ {
             gsub(/^\([0-9]+\) /, "")
-            svc_name = $0
+            svc = $0
             getline
             if ($0 ~ /Device: [a-z0-9]+\)/) {
                 sub(/.*Device: /, "")
                 sub(/\).*/, "")
                 iface = $0
                 if (iface !~ /^(lo|utun|awdl|llw|bridge|gif|stf|p2p)/) {
-                    print svc_name
+                    print svc "|" iface
                 }
             }
         }
     ')
     
-    echo "$active_services" | while IFS= read -r svc_name; do
+    # 过滤出有 inet 的活动接口(避免管道子shell)
+    active_filtered=""
+    while IFS='|' read -r svc_name svc_iface; do
+        [ -z "$svc_name" ] && continue
+        if ifconfig "$svc_iface" 2>/dev/null | grep -q 'inet '; then
+            active_filtered="${active_filtered}${svc_name}|${svc_iface}"$'\n'
+        fi
+    done <<EOF
+$all_mappings
+EOF
+    
+    # 输出启用 IPv6 的活动服务(NUL分隔)
+    while IFS='|' read -r svc_name svc_iface; do
         [ -z "$svc_name" ] && continue
         v6_info=$(networksetup -getinfo "$svc_name" 2>/dev/null | grep -i '^IPv6:')
         if [ -n "$v6_info" ] && ! echo "$v6_info" | grep -qi 'off'; then
             printf '%s\0' "$svc_name"
         fi
-    done
+    done <<EOF
+$active_filtered
+EOF
 }
 
 # 代理客户端显示名(供检查细节输出)
