@@ -840,10 +840,16 @@ def write_changes(changes):
 def assess_probe(policy, expected_ip, output, exit_code):
     if exit_code != "0":
         return "fail:STUN 探测执行失败，未确认 UDP 出口"
+    # 验证 expected_ip 是否为有效 IPv4(STUN 仅支持 IPv4)
     try:
         expected = ipaddress.IPv4Address(expected_ip)
     except ValueError:
-        return "fail:未获取有效的 IPv4 出口，无法比对 STUN 结果"
+        # expected_ip 不是 IPv4: 可能是 IPv6、空值或无效格式
+        # 这不是 STUN 泄漏,而是无法获取可靠的 IPv4 观测进行比对
+        if ":" in expected_ip:
+            # 明确是 IPv6 地址
+            return "warn:出口为 IPv6,STUN 比对需 IPv4 观测,无法验证(非泄漏)"
+        return "warn:未获取有效 IPv4 出口,无法比对 STUN(非探测失败)"
     if output == "RESULT:NONE":
         if policy == "reject":
             return "ok:常见 STUN UDP 拒绝规则已验证，探测无响应"
@@ -972,6 +978,52 @@ log_result() {
 
 # TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管(兼容各种 TUN 设备名)
 tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
+
+# IPv6 状态检测: 返回 off|on:服务名|unknown:原因
+check_ipv6_status() {
+    # 先检查物理接口(en0 等)是否有 inet6 地址
+    if ifconfig 2>/dev/null | grep -q 'inet6 '; then
+        # 有 IPv6 地址,检查哪些网络服务启用了 IPv6
+        local services enabled_services
+        services=$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | grep -v '^An asterisk')
+        if [ -z "$services" ]; then
+            echo "on:物理接口有 inet6,但无法列出网络服务"
+            return
+        fi
+        enabled_services=""
+        while IFS= read -r svc; do
+            [ -z "$svc" ] && continue
+            v6_info=$(networksetup -getinfo "$svc" 2>/dev/null | grep -i '^IPv6:')
+            if [ -n "$v6_info" ] && ! echo "$v6_info" | grep -qi 'off'; then
+                enabled_services="${enabled_services}${enabled_services:+,}$svc"
+            fi
+        done <<< "$services"
+        if [ -n "$enabled_services" ]; then
+            echo "on:$enabled_services"
+        else
+            echo "on:物理接口有 inet6,但网络服务显示 Off(UI 可能不同步)"
+        fi
+    else
+        # 无 inet6 地址,认为已关闭
+        echo "off"
+    fi
+}
+
+# 获取启用了 IPv6 的网络服务名(空格分隔,服务名可能含空格)
+get_ipv6_enabled_services() {
+    local services svc v6_info result
+    services=$(networksetup -listallnetworkservices 2>/dev/null | grep -v '^\*' | grep -v '^An asterisk')
+    result=""
+    while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        v6_info=$(networksetup -getinfo "$svc" 2>/dev/null | grep -i '^IPv6:')
+        if [ -n "$v6_info" ] && ! echo "$v6_info" | grep -qi 'off'; then
+            # 服务名可能含空格,用换行分隔
+            result="${result}${svc}"$'\n'
+        fi
+    done <<< "$services"
+    echo "$result"
+}
 
 # 代理客户端显示名(供检查细节输出)
 proxy_name() {
@@ -1229,8 +1281,13 @@ check() {
     locale=$(defaults read -g AppleLocale 2>/dev/null)
     [ "$locale" = "$LOCALE_TARGET" ] || fails="$fails;地区异常($locale)"
 
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || fails="$fails;IPv6未关闭"
+    # IPv6 检测: 查询所有活动网络服务(不硬编码服务名)
+    v6_status=$(check_ipv6_status)
+    case "$v6_status" in
+        off) ;;  # IPv6 已关闭,通过
+        on:*) fails="$fails;IPv6未关闭(${v6_status#on:})" ;;
+        unknown:*) ;;  # 无法确定,不作为失败(可能无网络服务)
+    esac
 
     if ! check_disabled "DNS"; then
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
@@ -1380,7 +1437,12 @@ checkdetail() {
         echo "代理内核=fail:$(proxy_name) 未运行"
     fi
     if tun_up; then echo 'TUN网卡=ok'; else echo 'TUN网卡=fail:不在线'; fi
-    trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    # 优先获取 IPv4 地址(用于 STUN 比对),回退到任意地址族
+    trace=$(curl -4 -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    if [ -z "$trace" ] || ! echo "$trace" | grep -q '^ip='; then
+        # IPv4 失败,尝试不限制地址族
+        trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    fi
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     if [ "$loc" = "$COUNTRY_TARGET" ]; then echo "出口IP=ok:$ip/$loc"; else echo "出口IP=fail:${ip:-无}/${loc:-未知}(期望$COUNTRY_TARGET)"; fi
@@ -1409,8 +1471,12 @@ checkdetail() {
     if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo '时区=ok'; else echo "时区=fail:$tz"; fi
     locale=$(defaults read -g AppleLocale 2>/dev/null)
     if [ "$locale" = "$LOCALE_TARGET" ]; then echo '地区=ok'; else echo "地区=fail:$locale"; fi
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭'; fi
+    v6_status=$(check_ipv6_status)
+    case "$v6_status" in
+        off) echo 'IPv6=ok:已关闭' ;;
+        on:*) echo "IPv6=fail:${v6_status#on:}" ;;
+        unknown:*) echo "IPv6=warn:${v6_status#unknown:}" ;;
+    esac
     if check_disabled "DNS"; then
         optional_result "DNS" ok
     else
@@ -1615,10 +1681,19 @@ fix() {
 
     # B. 时区/IPv6/DNS缓存/保镖(需管理员权限,会弹一次密码框)
     tz=$(readlink /etc/localtime 2>/dev/null)
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
+    v6_status=$(check_ipv6_status)
     adminCmds=""
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
-    echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
+    # IPv6 关闭: 仅当明确检测到启用时才关闭(获取实际服务名)
+    case "$v6_status" in
+        on:*)
+            v6_services=$(get_ipv6_enabled_services)
+            if [ -n "$v6_services" ]; then
+                for svc in $v6_services; do
+                    adminCmds="${adminCmds}networksetup -setv6off '$svc'; "
+                done
+            fi ;;
+    esac
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         adminCmds="${adminCmds}cp -X $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ || exit 1; /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist 2>/dev/null || true; chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1; "
     fi
